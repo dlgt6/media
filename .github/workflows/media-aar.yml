@@ -1,0 +1,131 @@
+name: Build media AARs
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "deps*"
+
+concurrency:
+  group: media-aar-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build lib-*-release.aar
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      # 写权限仅在推 deps* 标签发布 Release 时需要
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # decoder_ffmpeg 需要 NDK 29（版本来自 decoder_ffmpeg 的 native-dependencies.properties）
+      - name: Prepare Android SDK
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "ndk;29.0.14206865" > /dev/null 2>&1 || true
+
+      # 只编 TV 需要的 13 个模块；产物名即 lib-<模块>-release.aar，
+      # 与 TV 仓库 app/libs 的 lib-*.aar 约定完全一致
+      - name: Build AARs
+        run: >
+          chmod +x gradlew &&
+          ./gradlew --stacktrace
+          :lib-common:assembleRelease
+          :lib-database:assembleRelease
+          :lib-datasource:assembleRelease
+          :lib-datasource-okhttp:assembleRelease
+          :lib-decoder:assembleRelease
+          :lib-decoder-ffmpeg:assembleRelease
+          :lib-effect:assembleRelease
+          :lib-exoplayer:assembleRelease
+          :lib-extractor:assembleRelease
+          :lib-mpvplayer:assembleRelease
+          :lib-session:assembleRelease
+          :lib-ui:assembleRelease
+          :lib-ui-danmaku:assembleRelease
+
+      # 注意：gradle.properties 里 buildDir=buildout，产物在 buildout/outputs/aar 下
+      - name: Collect AARs and enforce 25MB limit
+        run: |
+          mkdir -p dist
+          find libraries -path '*/buildout/outputs/aar/*-release.aar' -exec cp -v {} dist/ \;
+          cat > /tmp/split_over_limit.py <<'EOF'
+          import os, shutil, zipfile
+
+          LIMIT = 25 * 1024 * 1024
+          dist = 'dist'
+
+          for name in sorted(os.listdir(dist)):
+              path = os.path.join(dist, name)
+              if not name.endswith('.aar') or os.path.getsize(path) <= LIMIT:
+                  continue
+              # 超限：按 ABI 拆两个 aar；arm32 那份只带 jni 不带 classes.jar，避免重复类
+              base = name[:-4]
+              work = '/tmp/aarwork'
+              shutil.rmtree(work, ignore_errors=True)
+              os.makedirs(work)
+              with zipfile.ZipFile(path) as z:
+                  z.extractall(work)
+              arm64 = os.path.join(dist, base + '-arm64.aar')
+              arm32 = os.path.join(dist, base + '-arm32-native.aar')
+              with zipfile.ZipFile(arm64, 'w', zipfile.ZIP_DEFLATED) as z:
+                  for root, _, files in os.walk(work):
+                      for f in files:
+                          p = os.path.join(root, f)
+                          rel = os.path.relpath(p, work).replace(os.sep, '/')
+                          if rel.startswith('jni/armeabi-v7a/'):
+                              continue
+                          z.write(p, rel)
+              with zipfile.ZipFile(arm32, 'w', zipfile.ZIP_DEFLATED) as z:
+                  z.write(os.path.join(work, 'AndroidManifest.xml'), 'AndroidManifest.xml')
+              jni32 = os.path.join(work, 'jni', 'armeabi-v7a')
+              for root, _, files in os.walk(jni32):
+                  for f in files:
+                      p = os.path.join(root, f)
+                      rel = os.path.relpath(p, work).replace(os.sep, '/')
+                      z.write(p, rel)
+              os.remove(path)
+              print('split:', name, '->', os.path.basename(arm64), '+', os.path.basename(arm32))
+
+          bad = []
+          for f in sorted(os.listdir(dist)):
+              if not f.endswith('.aar'):
+                  continue
+              size = os.path.getsize(os.path.join(dist, f))
+              print('%-40s %6.1f MB' % (f, size / 1048576))
+              if size > LIMIT:
+                  bad.append(f)
+          for f in bad:
+              print('::error::%s 仍超过 25MB' % f)
+          raise SystemExit(1 if bad else 0)
+          EOF
+          python3 /tmp/split_over_limit.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-aars
+          path: dist/*.aar
+          if-no-files-found: error
+
+      # 推一个名为 deps 的标签，runner 会直接把 aar 挂到该 Release（不占用本地带宽）
+      - name: Publish to deps release
+        if: startsWith(github.ref, 'refs/tags/deps')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.aar
+          fail_on_unmatched_files: true
