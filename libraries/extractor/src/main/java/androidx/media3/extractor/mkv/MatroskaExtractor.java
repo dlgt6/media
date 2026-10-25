@@ -112,7 +112,11 @@ public class MatroskaExtractor implements Extractor {
   @Target(TYPE_USE)
   @IntDef(
       flag = true,
-      value = {FLAG_DISABLE_SEEK_FOR_CUES, FLAG_EMIT_RAW_SUBTITLE_DATA})
+      value = {
+        FLAG_DISABLE_SEEK_FOR_CUES,
+        FLAG_EMIT_RAW_SUBTITLE_DATA,
+        FLAG_DEFER_SEEK_FOR_CUES
+      })
   public @interface Flags {}
 
   /**
@@ -130,6 +134,11 @@ public class MatroskaExtractor implements Extractor {
    * transcoded to {@link MimeTypes#APPLICATION_MEDIA3_CUES} during extraction.
    */
   public static final int FLAG_EMIT_RAW_SUBTITLE_DATA = 1 << 1; // 2
+  /**
+   * Enables deferring the seek for cue points on HTTP sources: playback starts immediately and
+   * cue points are fetched the first time a seek is requested, instead of blocking startup.
+   */
+  public static final int FLAG_DEFER_SEEK_FOR_CUES = 1 << 2; // 4
 
   /**
    * @deprecated Use {@link #newFactory(SubtitleParser.Factory)} instead.
@@ -459,6 +468,11 @@ public class MatroskaExtractor implements Extractor {
   private final SparseArray<Track> tracks;
   private final LongSparseArray<ChapterEntry> chapters;
   private final boolean seekForCuesEnabled;
+  private final boolean deferSeekForCues;
+  private boolean deferredCuesRequested;
+  private long pendingRedirectPosition;
+  private long pendingUserSeekUs;
+  @Nullable private MatroskaSeekMap deferredSeekMap;
   private final boolean parseSubtitlesDuringExtraction;
   private final SubtitleParser.Factory subtitleParserFactory;
 
@@ -595,6 +609,9 @@ public class MatroskaExtractor implements Extractor {
     this.subtitleParserFactory = subtitleParserFactory;
     this.perTrackCues = new SparseArray<>();
     seekForCuesEnabled = (flags & FLAG_DISABLE_SEEK_FOR_CUES) == 0;
+    deferSeekForCues = (flags & FLAG_DEFER_SEEK_FOR_CUES) != 0;
+    pendingRedirectPosition = C.INDEX_UNSET;
+    pendingUserSeekUs = C.TIME_UNSET;
     parseSubtitlesDuringExtraction = (flags & FLAG_EMIT_RAW_SUBTITLE_DATA) == 0;
     varintReader = new VarintReader();
     chapters = new LongSparseArray<>();
@@ -630,6 +647,19 @@ public class MatroskaExtractor implements Extractor {
   @CallSuper
   @Override
   public void seek(long position, long timeUs) {
+    if (deferSeekForCues && seekForCuesEnabled && cuesContentPosition != C.INDEX_UNSET) {
+      if (deferredSeekMap != null) {
+        // Cue points are available: redirect the next read to the exact byte position.
+        SeekMap.SeekPoints seekPoints = deferredSeekMap.getSeekPoints(timeUs);
+        pendingRedirectPosition = seekPoints.first.position;
+        pendingUserSeekUs = C.TIME_UNSET;
+      } else if (!deferredCuesRequested) {
+        // Fetch the cue points first; the target is resolved once they are parsed.
+        deferredCuesRequested = true;
+        pendingUserSeekUs = timeUs;
+        seekForCues = true;
+      }
+    }
     clusterTimecodeUs = C.TIME_UNSET;
     blockState = BLOCK_STATE_START;
     reader.reset();
@@ -658,6 +688,11 @@ public class MatroskaExtractor implements Extractor {
 
   @Override
   public final int read(ExtractorInput input, PositionHolder seekPosition) throws IOException {
+    if (pendingRedirectPosition != C.INDEX_UNSET) {
+      seekPosition.position = pendingRedirectPosition;
+      pendingRedirectPosition = C.INDEX_UNSET;
+      return Extractor.RESULT_SEEK;
+    }
     haveOutputSample = false;
     boolean continueReading = true;
     while (continueReading && !haveOutputSample) {
@@ -866,9 +901,17 @@ public class MatroskaExtractor implements Extractor {
         }
         if (!sentSeekMap) {
           // We need to build cues before parsing the cluster.
-          if (seekForCuesEnabled && cuesContentPosition != C.INDEX_UNSET) {
+          if (seekForCuesEnabled
+              && !deferSeekForCues
+              && cuesContentPosition != C.INDEX_UNSET) {
             // We know where the Cues element is located. Seek to request it.
             seekForCues = true;
+          } else if (deferSeekForCues
+              && seekForCuesEnabled
+              && cuesContentPosition != C.INDEX_UNSET) {
+            // Start playback immediately; cue points are fetched on the first seek request.
+            extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
+            sentSeekMap = true;
           } else {
             // We don't know where the Cues element is located. It's most likely omitted. Allow
             // playback, but disable seeking.
@@ -944,7 +987,27 @@ public class MatroskaExtractor implements Extractor {
               break;
             }
           }
-          if (!hasAnyCues || durationUs == C.TIME_UNSET) {
+          if (sentSeekMap) {
+            // Deferred mode: the seek map was already published, keep the parsed cue points for
+            // accurate seeking and resolve a pending user seek.
+            if (hasAnyCues && durationUs != C.TIME_UNSET) {
+              for (int i = 0; i < perTrackCues.size(); i++) {
+                Collections.sort(perTrackCues.valueAt(i));
+              }
+              deferredSeekMap =
+                  new MatroskaSeekMap(
+                      perTrackCues,
+                      durationUs,
+                      primarySeekTrackNumber,
+                      segmentContentPosition,
+                      segmentContentSize);
+              if (pendingUserSeekUs != C.TIME_UNSET) {
+                pendingRedirectPosition =
+                    deferredSeekMap.getSeekPoints(pendingUserSeekUs).first.position;
+                pendingUserSeekUs = C.TIME_UNSET;
+              }
+            }
+          } else if (!hasAnyCues || durationUs == C.TIME_UNSET) {
             // Cues are missing, empty, or duration is unknown.
             extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
           } else {
