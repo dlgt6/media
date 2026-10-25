@@ -30,7 +30,7 @@ import static java.lang.annotation.ElementType.TYPE_USE;
 
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
-import android.animation.DecelerateInterpolator;
+import android.view.animation.DecelerateInterpolator;
 import android.animation.ValueAnimator;
 import android.annotation.SuppressLint;
 import android.content.Context;
