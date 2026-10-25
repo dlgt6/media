@@ -118,6 +118,21 @@ public final class MpvPlaybackEventHandler implements MpvEventAdapter.PlayerEven
   }
 
   @Override
+  public boolean onDiscNavigationActiveProperty(boolean navigationActive) {
+    return host.onDiscNavigationActiveProperty(navigationActive);
+  }
+
+  @Override
+  public boolean onDiscMenuActiveProperty(boolean menuActive) {
+    return host.onDiscMenuActiveProperty(menuActive);
+  }
+
+  @Override
+  public boolean onDiscMenuSupportedProperty(boolean menuSupported) {
+    return host.onDiscMenuSupportedProperty(menuSupported);
+  }
+
+  @Override
   public void onStartFile() {
     endFileGuard.clear();
     playbackState.onStartFile();
@@ -266,5 +281,11 @@ public final class MpvPlaybackEventHandler implements MpvEventAdapter.PlayerEven
     void onNativeShutdown();
 
     void fail(PlaybackException error);
+
+    boolean onDiscNavigationActiveProperty(boolean navigationActive);
+
+    boolean onDiscMenuActiveProperty(boolean menuActive);
+
+    boolean onDiscMenuSupportedProperty(boolean menuSupported);
   }
 }
