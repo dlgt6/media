@@ -117,17 +117,14 @@ public final class MpvPlaybackEventHandler implements MpvEventAdapter.PlayerEven
     return propertyEventHandler;
   }
 
-  @Override
   public boolean onDiscNavigationActiveProperty(boolean navigationActive) {
     return host.onDiscNavigationActiveProperty(navigationActive);
   }
 
-  @Override
   public boolean onDiscMenuActiveProperty(boolean menuActive) {
     return host.onDiscMenuActiveProperty(menuActive);
   }
 
-  @Override
   public boolean onDiscMenuSupportedProperty(boolean menuSupported) {
     return host.onDiscMenuSupportedProperty(menuSupported);
   }
