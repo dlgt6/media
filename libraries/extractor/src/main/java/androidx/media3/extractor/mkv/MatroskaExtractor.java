@@ -877,18 +877,18 @@ public class MatroskaExtractor implements Extractor {
         seekEntryPosition = C.INDEX_UNSET;
         break;
       case ID_CUES:
-        if (!sentSeekMap) {
+        if (shouldCollectCues()) {
           inCuesElement = true;
         }
         break;
       case ID_CUE_POINT:
-        if (!sentSeekMap) {
+        if (shouldCollectCues()) {
           assertInCues(id);
           currentCueTimeUs = C.TIME_UNSET;
         }
         break;
       case ID_CUE_TRACK_POSITIONS:
-        if (!sentSeekMap) {
+        if (shouldCollectCues()) {
           assertInCues(id);
           currentCueTrackNumber = C.INDEX_UNSET;
           currentCueClusterPosition = C.INDEX_UNSET;
@@ -979,35 +979,39 @@ public class MatroskaExtractor implements Extractor {
         }
         break;
       case ID_CUES:
-        if (!sentSeekMap) {
-          boolean hasAnyCues = false;
-          for (int i = 0; i < perTrackCues.size(); i++) {
-            if (!perTrackCues.valueAt(i).isEmpty()) {
-              hasAnyCues = true;
-              break;
+        boolean hasAnyCues = false;
+        for (int i = 0; i < perTrackCues.size(); i++) {
+          if (!perTrackCues.valueAt(i).isEmpty()) {
+            hasAnyCues = true;
+            break;
+          }
+        }
+        if (sentSeekMap) {
+          // Deferred mode: an unseekable map was already published so playback could start
+          // immediately. Now that the cue points have been fetched on the first seek request, build
+          // the real seek map from them and resolve any pending user seek.
+          if (deferSeekForCues && hasAnyCues && durationUs != C.TIME_UNSET) {
+            for (int i = 0; i < perTrackCues.size(); i++) {
+              Collections.sort(perTrackCues.valueAt(i));
+            }
+            deferredSeekMap =
+                new MatroskaSeekMap(
+                    perTrackCues,
+                    durationUs,
+                    primarySeekTrackNumber,
+                    segmentContentPosition,
+                    segmentContentSize);
+            if (pendingUserSeekUs != C.TIME_UNSET) {
+              pendingRedirectPosition =
+                  deferredSeekMap.getSeekPoints(pendingUserSeekUs).first.position;
+              pendingUserSeekUs = C.TIME_UNSET;
+              // The user is seeking away from the current position; don't also bounce back to it.
+              seekPositionAfterBuildingCues = C.INDEX_UNSET;
             }
           }
-          if (sentSeekMap) {
-            // Deferred mode: the seek map was already published, keep the parsed cue points for
-            // accurate seeking and resolve a pending user seek.
-            if (hasAnyCues && durationUs != C.TIME_UNSET) {
-              for (int i = 0; i < perTrackCues.size(); i++) {
-                Collections.sort(perTrackCues.valueAt(i));
-              }
-              deferredSeekMap =
-                  new MatroskaSeekMap(
-                      perTrackCues,
-                      durationUs,
-                      primarySeekTrackNumber,
-                      segmentContentPosition,
-                      segmentContentSize);
-              if (pendingUserSeekUs != C.TIME_UNSET) {
-                pendingRedirectPosition =
-                    deferredSeekMap.getSeekPoints(pendingUserSeekUs).first.position;
-                pendingUserSeekUs = C.TIME_UNSET;
-              }
-            }
-          } else if (!hasAnyCues || durationUs == C.TIME_UNSET) {
+          inCuesElement = false;
+        } else {
+          if (!hasAnyCues || durationUs == C.TIME_UNSET) {
             // Cues are missing, empty, or duration is unknown.
             extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
           } else {
@@ -1037,7 +1041,7 @@ public class MatroskaExtractor implements Extractor {
         }
         break;
       case ID_CUE_TRACK_POSITIONS:
-        if (!sentSeekMap) {
+        if (shouldCollectCues()) {
           assertInCues(id);
           if (currentCueTimeUs != C.TIME_UNSET
               && currentCueTrackNumber != C.INDEX_UNSET
@@ -1368,19 +1372,19 @@ public class MatroskaExtractor implements Extractor {
         }
         break;
       case ID_CUE_TIME:
-        if (!sentSeekMap) {
+        if (shouldCollectCues()) {
           assertInCues(id);
           currentCueTimeUs = scaleTimecodeToUs(value);
         }
         break;
       case ID_CUE_TRACK:
-        if (!sentSeekMap) {
+        if (shouldCollectCues()) {
           assertInCues(id);
           currentCueTrackNumber = (int) value;
         }
         break;
       case ID_CUE_CLUSTER_POSITION:
-        if (!sentSeekMap) {
+        if (shouldCollectCues()) {
           assertInCues(id);
           if (currentCueClusterPosition == C.INDEX_UNSET) {
             currentCueClusterPosition = value;
@@ -1388,7 +1392,7 @@ public class MatroskaExtractor implements Extractor {
         }
         break;
       case ID_CUE_RELATIVE_POSITION:
-        if (!sentSeekMap) {
+        if (shouldCollectCues()) {
           assertInCues(id);
           if (currentCueRelativePosition == C.INDEX_UNSET) {
             currentCueRelativePosition = value;
@@ -2289,6 +2293,16 @@ public class MatroskaExtractor implements Extractor {
       bytesWritten = output.sampleData(input, length, false);
     }
     return bytesWritten;
+  }
+
+  /**
+   * Whether cue-point elements should currently be collected into {@link #perTrackCues}. Normally
+   * this is only done before the seek map is sent. In deferred mode the seek map is published early
+   * as unseekable so that playback can start, and the cue points are collected later, on the first
+   * seek request, until the deferred seek map has been built.
+   */
+  private boolean shouldCollectCues() {
+    return !sentSeekMap || (deferSeekForCues && deferredSeekMap == null);
   }
 
   /**
