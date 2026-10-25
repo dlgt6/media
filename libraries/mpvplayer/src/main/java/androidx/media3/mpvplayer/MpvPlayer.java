@@ -154,6 +154,10 @@ public final class MpvPlayer extends SimpleBasePlayer implements DiscMenuControl
   private boolean subtitleContentEnabled = true;
   private boolean secondaryTextAutoSelection = true;
   private boolean verboseLoggingEnabled;
+  private int cachedDiscNavigationActive = -1;
+  private int cachedDiscMenuActive = -1;
+  private int cachedDiscMenuSupported = -1;
+  private DiscMenuState cachedDiscMenuState = DiscMenuState.EMPTY;
   private final MpvSurfaceController surfaceController;
   private final MpvAudioFocusManager audioFocusManager;
   private final MpvTrackController trackController;
@@ -411,6 +415,7 @@ public final class MpvPlayer extends SimpleBasePlayer implements DiscMenuControl
         stateBuilder.buildBaseState(
             playerInfo.createStateSnapshot(
                 trackController.getParameters(), reportRenderedFirstFrame));
+    builder.setDiscMenuState(computeDiscMenuState());
     if (!playlist.isEmpty()) {
       builder.setCurrentMediaItemIndex(playlist.currentIndex());
     }
@@ -957,23 +962,21 @@ public final class MpvPlayer extends SimpleBasePlayer implements DiscMenuControl
 
   @Override
   public boolean open(String action, Consumer<OpenResult> callback) {
-    String mappedAction = mapDiscMenuAction(action);
-    if (mappedAction == null || playlist.currentUri() == null) {
+    if (!isSupportedDiscMenuAction(action) || playlist.currentUri() == null) {
       callback.accept(OpenResult.UNAVAILABLE);
       return false;
     }
-    boolean dispatched = commandDispatcher.command("discnav", mappedAction);
+    boolean dispatched = commandDispatcher.command("discnav", action);
     callback.accept(dispatched ? OpenResult.OPENED : OpenResult.UNAVAILABLE);
     return dispatched;
   }
 
   @Override
   public boolean sendAction(String action) {
-    String mappedAction = mapDiscMenuAction(action);
-    if (mappedAction == null) {
+    if (!isSupportedDiscMenuAction(action)) {
       return false;
     }
-    return commandDispatcher.command("discnav", mappedAction);
+    return commandDispatcher.command("discnav", action);
   }
 
   @Override
@@ -984,6 +987,10 @@ public final class MpvPlayer extends SimpleBasePlayer implements DiscMenuControl
 
   @Override
   public boolean isNavigationPlayback() {
+    Boolean navigationActive = commandDispatcher.getPropertyBoolean("disc-navigation-active");
+    if (navigationActive != null) {
+      return navigationActive;
+    }
     Uri currentUri = playlist.currentUri();
     if (currentUri == null) {
       return false;
@@ -992,19 +999,70 @@ public final class MpvPlayer extends SimpleBasePlayer implements DiscMenuControl
     return path != null && path.toLowerCase().endsWith(".iso");
   }
 
-  @Override
-  public DiscMenuState getDiscMenuState() {
-    if (!isNavigationPlayback()) {
-      return DiscMenuState.EMPTY;
-    }
-    return isActive()
-        ? new DiscMenuState(
-            DiscMenuState.AVAILABILITY_AVAILABLE, DiscMenuState.PHASE_ACTIVE, false)
-        : new DiscMenuState(
-            DiscMenuState.AVAILABILITY_AVAILABLE, DiscMenuState.PHASE_IDLE, false);
+  /** Updates the cached disc navigation state from the observed mpv property. */
+  /* package */ boolean onDiscNavigationActiveProperty(boolean navigationActive) {
+    cachedDiscNavigationActive = navigationActive ? 1 : 0;
+    return updateCachedDiscMenuState();
   }
 
-  private static String mapDiscMenuAction(String action) {
+  /** Updates the cached disc menu state from the observed mpv property. */
+  /* package */ boolean onDiscMenuActiveProperty(boolean menuActive) {
+    cachedDiscMenuActive = menuActive ? 1 : 0;
+    return updateCachedDiscMenuState();
+  }
+
+  /** Updates the cached disc menu support state from the observed mpv property. */
+  /* package */ boolean onDiscMenuSupportedProperty(boolean menuSupported) {
+    cachedDiscMenuSupported = menuSupported ? 1 : 0;
+    return updateCachedDiscMenuState();
+  }
+
+  /** Returns the current disc menu state, preferring values observed from mpv events. */
+  private DiscMenuState computeDiscMenuState() {
+    boolean navigationPlaybackOngoing =
+        cachedDiscNavigationActive >= 0 ? cachedDiscNavigationActive == 1 : isNavigationPlayback();
+    if (!navigationPlaybackOngoing) {
+      return DiscMenuState.EMPTY;
+    }
+    int availability;
+    if (cachedDiscMenuSupported >= 0) {
+      availability =
+          cachedDiscMenuSupported == 1
+              ? DiscMenuState.AVAILABILITY_AVAILABLE
+              : DiscMenuState.AVAILABILITY_UNAVAILABLE;
+    } else {
+      Boolean supported = commandDispatcher.getPropertyBoolean("disc-menu-supported");
+      availability =
+          supported == null
+              ? DiscMenuState.AVAILABILITY_PENDING
+              : supported
+                  ? DiscMenuState.AVAILABILITY_AVAILABLE
+                  : DiscMenuState.AVAILABILITY_UNAVAILABLE;
+    }
+    if (availability != DiscMenuState.AVAILABILITY_AVAILABLE) {
+      return new DiscMenuState(
+          availability, DiscMenuState.PHASE_IDLE, /* navigationPlaybackOngoing= */ true);
+    }
+    boolean menuActive =
+        cachedDiscMenuActive >= 0
+            ? cachedDiscMenuActive == 1
+            : Boolean.TRUE.equals(commandDispatcher.getPropertyBoolean("disc-menu-active"));
+    return new DiscMenuState(
+        DiscMenuState.AVAILABILITY_AVAILABLE,
+        menuActive ? DiscMenuState.PHASE_ACTIVE : DiscMenuState.PHASE_IDLE,
+        /* navigationPlaybackOngoing= */ true);
+  }
+
+  private boolean updateCachedDiscMenuState() {
+    DiscMenuState newState = computeDiscMenuState();
+    if (cachedDiscMenuState.equals(newState)) {
+      return false;
+    }
+    cachedDiscMenuState = newState;
+    return true;
+  }
+
+  private static boolean isSupportedDiscMenuAction(String action) {
     switch (action) {
       case "up":
       case "down":
@@ -1012,13 +1070,12 @@ public final class MpvPlayer extends SimpleBasePlayer implements DiscMenuControl
       case "right":
       case "select":
       case "menu":
+      case "title-menu":
       case "popup":
       case "prev":
-        return action;
-      case "title-menu":
-        return "title";
+        return true;
       default:
-        return null;
+        return false;
     }
   }
 
